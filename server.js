@@ -1,13 +1,15 @@
 import express from "express";
 import cors from "cors";
 import Stripe from "stripe";
-import shippo from "shippo";
+import Shippo from "shippo";
 
 const app = express();
 app.use(cors());
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const shippoClient = shippo(process.env.SHIPPO_API_KEY);
+const shippoClient = new Shippo({
+  apiKey: process.env.SHIPPO_API_KEY
+});
 
 /* ======================
    STRIPE WEBHOOK (RAW)
