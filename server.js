@@ -2,27 +2,25 @@ import express from "express";
 import cors from "cors";
 import Stripe from "stripe";
 
-/* ======================
-   BASIC APP SETUP
-====================== */
 const app = express();
 app.use(cors());
-
-// Health check (prevents "Cannot GET /" confusion)
-app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "shipping-api",
-    time: new Date().toISOString()
-  });
-});
+app.use(express.json());
+app.use(express.static("public"));
 
 /* ======================
-   SHIPPO REST CONFIG
+   CONFIG
 ====================== */
-const SHIPPO_BASE = "https://api.goshippo.com";
 const SHIPPO_TOKEN = process.env.SHIPPO_API_KEY;
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const BASE_URL = process.env.BASE_URL;
 
+const stripe = new Stripe(STRIPE_SECRET);
+const SHIPPO_BASE = "https://api.goshippo.com";
+
+/* ======================
+   SHIPPO HELPER
+====================== */
 async function shippoFetch(path, options = {}) {
   const res = await fetch(`${SHIPPO_BASE}${path}`, {
     ...options,
@@ -33,90 +31,53 @@ async function shippoFetch(path, options = {}) {
     }
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Shippo error ${res.status}: ${text}`);
-  }
-
-  return res.json();
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data;
 }
 
 /* ======================
-   STRIPE CONFIG
+   HEALTH CHECK
 ====================== */
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+app.get("/", (_, res) => {
+  res.json({ status: "ok" });
+});
 
-/* ======================
-   STRIPE WEBHOOK (RAW)
-====================== */
-app.post(
-  "/webhook/stripe",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("Webhook verification failed:", err.message);
-      return res.status(400).send("Webhook Error");
-    }
-
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const { rateId } = session.metadata;
-
-      try {
-        // Buy shipping label via Shippo REST API
-        await shippoFetch("/transactions", {
-          method: "POST",
-          body: JSON.stringify({
-            rate: rateId,
-            label_file_type: "PDF",
-            async: false
-          })
-        });
-      } catch (err) {
-        console.error("Shippo label purchase failed:", err.message);
-      }
-    }
-
-    res.json({ received: true });
-  }
-);
-
-/* ======================
-   JSON + STATIC FILES
-====================== */
-app.use(express.json());
-app.use(express.static("public"));
-
-/* ======================
-   GET SHIPPING RATES
-====================== */
-app.get("/api/shipping/:orderToken", async (req, res) => {
+/* ======================================================
+   1️⃣ ZAPIER STEP: CREATE SHIPPING SESSION
+====================================================== */
+app.post("/zapier/create-shipping-session", async (req, res) => {
   try {
-    const orderToken = req.params.orderToken;
+    const { from, to, parcel } = req.body;
 
-    // 1. Fetch Shippo order
-    const order = await shippoFetch(`/orders/${orderToken}`);
+    const shipment = await shippoFetch("/shipments/", {
+      method: "POST",
+      body: JSON.stringify({
+        address_from: from,
+        address_to: to,
+        parcels: [parcel],
+        async: false
+      })
+    });
 
-    if (!order.shipments || order.shipments.length === 0) {
-      return res.status(400).json({
-        error: "Order has no shipments. Ensure parcels were added."
-      });
-    }
+    const sessionId = shipment.object_id;
 
-    // 2. Fetch shipment
-    const shipmentId = order.shipments[0];
-    const shipment = await shippoFetch(`/shipments/${shipmentId}`);
+    res.json({
+      shipping_session_id: sessionId,
+      checkout_url: `${BASE_URL}/pay-shipping.html?session=${sessionId}`
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    // 3. Extract rates
+/* ======================================================
+   2️⃣ FRONTEND: FETCH LIVE RATES
+====================================================== */
+app.get("/api/shipping/:sessionId", async (req, res) => {
+  try {
+    const shipment = await shippoFetch(`/shipments/${req.params.sessionId}`);
+
     const rates = shipment.rates.map(r => ({
       rate_id: r.object_id,
       carrier: r.provider,
@@ -125,77 +86,69 @@ app.get("/api/shipping/:orderToken", async (req, res) => {
       eta: r.estimated_days
     }));
 
-    res.json({
-      customer: {
-        name: order.to_address?.name || "Customer",
-        city: order.to_address?.city,
-        state: order.to_address?.state
-      },
-      rates
-    });
+    res.json({ rates });
   } catch (err) {
-    console.error("Shipping fetch error:", err.message);
-    res.status(500).json({
-      error: "Failed to load shipping rates",
-      details: err.message
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
-/* ======================
-   CREATE STRIPE CHECKOUT
-====================== */
+/* ======================================================
+   3️⃣ CREATE STRIPE CHECKOUT
+====================================================== */
 app.post("/api/checkout", async (req, res) => {
   try {
-    const { orderToken, rateId } = req.body;
-
-    if (!orderToken || !rateId) {
-      return res.status(400).json({ error: "Missing orderToken or rateId" });
-    }
-
-    // Re-fetch order & shipment to prevent tampering
-    const order = await shippoFetch(`/orders/${orderToken}`);
-    const shipment = await shippoFetch(`/shipments/${order.shipments[0]}`);
-
-    const rate = shipment.rates.find(r => r.object_id === rateId);
-    if (!rate) {
-      return res.status(400).json({ error: "Invalid rate selected" });
-    }
+    const { rateId } = req.body;
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: `Shipping – ${rate.provider} ${rate.servicelevel.name}`
-            },
-            unit_amount: Math.round(Number(rate.amount) * 100)
-          },
-          quantity: 1
-        }
-      ],
+      line_items: [{
+        price_data: {
+          currency: "usd",
+          product_data: { name: "Shipping Charge" },
+          unit_amount: Math.round(req.body.amount * 100)
+        },
+        quantity: 1
+      }],
       metadata: { rateId },
-      success_url: `${process.env.BASE_URL}/shipping-success.html`,
-      cancel_url: `${process.env.BASE_URL}/shipping-cancelled.html`
+      success_url: `${BASE_URL}/success.html`,
+      cancel_url: `${BASE_URL}/cancel.html`
     });
 
     res.json({ url: session.url });
   } catch (err) {
-    console.error("Checkout error:", err.message);
-    res.status(500).json({
-      error: "Checkout failed",
-      details: err.message
-    });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ======================================================
+   4️⃣ STRIPE WEBHOOK → BUY LABEL
+====================================================== */
+app.post("/webhook/stripe", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const sig = req.headers["stripe-signature"];
+    const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+
+    if (event.type === "checkout.session.completed") {
+      const rateId = event.data.object.metadata.rateId;
+
+      await shippoFetch("/transactions/", {
+        method: "POST",
+        body: JSON.stringify({
+          rate: rateId,
+          label_file_type: "PDF",
+          async: false
+        })
+      });
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    res.status(400).send("Webhook error");
   }
 });
 
 /* ======================
-   START SERVER
+   START
 ====================== */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
