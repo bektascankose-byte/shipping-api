@@ -2,8 +2,20 @@ import express from "express";
 import cors from "cors";
 import Stripe from "stripe";
 
+/* ======================
+   BASIC APP SETUP
+====================== */
 const app = express();
 app.use(cors());
+
+// Health check (prevents "Cannot GET /" confusion)
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "shipping-api",
+    time: new Date().toISOString()
+  });
+});
 
 /* ======================
    SHIPPO REST CONFIG
@@ -30,7 +42,7 @@ async function shippoFetch(path, options = {}) {
 }
 
 /* ======================
-   STRIPE
+   STRIPE CONFIG
 ====================== */
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -51,7 +63,7 @@ app.post(
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      console.error(err.message);
+      console.error("Webhook verification failed:", err.message);
       return res.status(400).send("Webhook Error");
     }
 
@@ -59,15 +71,19 @@ app.post(
       const session = event.data.object;
       const { rateId } = session.metadata;
 
-      // ✅ BUY LABEL VIA SHIPPO REST API
-      await shippoFetch("/transactions", {
-        method: "POST",
-        body: JSON.stringify({
-          rate: rateId,
-          label_file_type: "PDF",
-          async: false
-        })
-      });
+      try {
+        // Buy shipping label via Shippo REST API
+        await shippoFetch("/transactions", {
+          method: "POST",
+          body: JSON.stringify({
+            rate: rateId,
+            label_file_type: "PDF",
+            async: false
+          })
+        });
+      } catch (err) {
+        console.error("Shippo label purchase failed:", err.message);
+      }
     }
 
     res.json({ received: true });
@@ -85,14 +101,22 @@ app.use(express.static("public"));
 ====================== */
 app.get("/api/shipping/:orderToken", async (req, res) => {
   try {
-    const order = await shippoFetch(`/orders/${req.params.orderToken}`);
+    const orderToken = req.params.orderToken;
 
-    if (!order.shipments || !order.shipments.length) {
-      return res.status(404).json({ error: "No shipment found" });
+    // 1. Fetch Shippo order
+    const order = await shippoFetch(`/orders/${orderToken}`);
+
+    if (!order.shipments || order.shipments.length === 0) {
+      return res.status(400).json({
+        error: "Order has no shipments. Ensure parcels were added."
+      });
     }
 
-    const shipment = await shippoFetch(`/shipments/${order.shipments[0]}`);
+    // 2. Fetch shipment
+    const shipmentId = order.shipments[0];
+    const shipment = await shippoFetch(`/shipments/${shipmentId}`);
 
+    // 3. Extract rates
     const rates = shipment.rates.map(r => ({
       rate_id: r.object_id,
       carrier: r.provider,
@@ -103,15 +127,18 @@ app.get("/api/shipping/:orderToken", async (req, res) => {
 
     res.json({
       customer: {
-        name: order.to_address?.name,
+        name: order.to_address?.name || "Customer",
         city: order.to_address?.city,
         state: order.to_address?.state
       },
       rates
     });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: "Failed to load shipping" });
+    console.error("Shipping fetch error:", err.message);
+    res.status(500).json({
+      error: "Failed to load shipping rates",
+      details: err.message
+    });
   }
 });
 
@@ -122,24 +149,34 @@ app.post("/api/checkout", async (req, res) => {
   try {
     const { orderToken, rateId } = req.body;
 
+    if (!orderToken || !rateId) {
+      return res.status(400).json({ error: "Missing orderToken or rateId" });
+    }
+
+    // Re-fetch order & shipment to prevent tampering
     const order = await shippoFetch(`/orders/${orderToken}`);
     const shipment = await shippoFetch(`/shipments/${order.shipments[0]}`);
 
     const rate = shipment.rates.find(r => r.object_id === rateId);
-    if (!rate) return res.status(400).json({ error: "Invalid rate" });
+    if (!rate) {
+      return res.status(400).json({ error: "Invalid rate selected" });
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      line_items: [{
-        price_data: {
-          currency: "usd",
-          product_data: {
-            name: `Shipping – ${rate.provider} ${rate.servicelevel.name}`
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: `Shipping – ${rate.provider} ${rate.servicelevel.name}`
+            },
+            unit_amount: Math.round(Number(rate.amount) * 100)
           },
-          unit_amount: Math.round(rate.amount * 100)
-        },
-        quantity: 1
-      }],
+          quantity: 1
+        }
+      ],
       metadata: { rateId },
       success_url: `${process.env.BASE_URL}/shipping-success.html`,
       cancel_url: `${process.env.BASE_URL}/shipping-cancelled.html`
@@ -147,15 +184,18 @@ app.post("/api/checkout", async (req, res) => {
 
     res.json({ url: session.url });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: "Checkout failed" });
+    console.error("Checkout error:", err.message);
+    res.status(500).json({
+      error: "Checkout failed",
+      details: err.message
+    });
   }
 });
 
 /* ======================
    START SERVER
 ====================== */
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
